@@ -53,7 +53,7 @@ setup(
         "yacs>=0.1.8",
         "graphviz>=0.20.3",
     ],
-    python_requires=">=3.9",
+    python_requires=">=3.12",
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Science/Research",
