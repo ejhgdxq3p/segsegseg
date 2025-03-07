@@ -7,11 +7,11 @@
 
 import os
 import time
-
+import wandb  # 导入 wandb
 import torch
 import torch.optim as optim
 import torchvision.transforms as transforms
-from tensorboardX import SummaryWriter
+#from tensorboardX import SummaryWriter
 #from dataset import *
 from torch.utils.data import DataLoader
 
@@ -31,9 +31,23 @@ def main():
         # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-
-
     args = cfg.parse_args()
+
+    wandb.init(
+        project="0306_seg_GPU*2",
+        name=args.exp_name,
+        config={
+                "learning_rate": args.lr,
+                "batch_size": args.b,
+                "image_size": args.image_size,
+                "out_size": args.out_size,
+                "dataset": args.dataset,
+                "epochs": settings.EPOCH,
+                "val_freq": args.val_freq,
+        }
+    )
+
+
     GPUdevice = torch.device('cuda', args.gpu_device)
 
     net = get_network(args, args.net, use_gpu=args.gpu, gpu_device=GPUdevice, distribution = args.distributed)
@@ -77,8 +91,8 @@ def main():
     #use tensorboard
     if not os.path.exists(settings.LOG_DIR):
         os.mkdir(settings.LOG_DIR)
-    writer = SummaryWriter(log_dir=os.path.join(
-            settings.LOG_DIR, args.net, settings.TIME_NOW))
+#    writer = SummaryWriter(log_dir=os.path.join(
+#            settings.LOG_DIR, args.net, settings.TIME_NOW))
 
     #create checkpoint folder to save model
     if not os.path.exists(checkpoint_path):
@@ -94,14 +108,15 @@ def main():
     for epoch in range(settings.EPOCH):
 
         if epoch == 0:
-            tol, (eiou, edice) = function.validation_sam(args, nice_test_loader, epoch, net, writer)
+            tol, (eiou, edice) = function.validation_sam(args, nice_test_loader, epoch, net)
             logger.info(f'Total score: {tol}, IOU: {eiou}, DICE: {edice} || @ epoch {epoch}.')
 
         # training
         net.train()
         time_start = time.time()
-        loss = function.train_sam(args, net, optimizer, nice_train_loader, epoch, writer)
+        loss = function.train_sam(args, net, optimizer, nice_train_loader, epoch)
         logger.info(f'Train loss: {loss} || @ epoch {epoch}.')
+        wandb.log({"train_loss": loss, "epoch": epoch})   
         time_end = time.time()
         print('time_for_training ', time_end - time_start)
 
@@ -109,16 +124,21 @@ def main():
         net.eval()
         if epoch % args.val_freq == 0 or epoch == settings.EPOCH-1:
 
-            tol, (eiou, edice) = function.validation_sam(args, nice_test_loader, epoch, net, writer)
+            tol, (eiou, edice) = function.validation_sam(args, nice_test_loader, epoch, net,)
             logger.info(f'Total score: {tol}, IOU: {eiou}, DICE: {edice} || @ epoch {epoch}.')
-
+            wandb.log({
+                "val_total_score": tol,
+                "val_iou": eiou,
+                "val_dice": edice,
+                "epoch": epoch
+                })
             if edice > best_dice:
                 best_dice = edice
                 torch.save({'model': net.state_dict(), 'parameter': net._parameters}, os.path.join(args.path_helper['ckpt_path'], 'latest_epoch.pth'))
+                wandb.save(os.path.join(args.path_helper['ckpt_path'], 'latest_epoch.pth'))
 
-
-    writer.close()
-
+#    writer.close()
+    wandb.finish()
 
 if __name__ == '__main__':
     main()

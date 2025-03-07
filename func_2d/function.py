@@ -22,7 +22,7 @@ mask_type = torch.float32
 torch.backends.cudnn.benchmark = True
 
 
-def train_sam(args, net: nn.Module, optimizer, train_loader, epoch, writer):
+def train_sam(args, net: nn.Module, optimizer, train_loader, epoch):
     
     # use bfloat16 for the entire notebook
     torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
