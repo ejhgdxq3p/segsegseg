@@ -11,7 +11,7 @@ import wandb  # 导入 wandb
 import torch
 import torch.optim as optim
 import torchvision.transforms as transforms
-#from tensorboardX import SummaryWriter
+from tensorboardX import SummaryWriter
 #from dataset import *
 from torch.utils.data import DataLoader
 
@@ -31,8 +31,10 @@ def main():
         # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+
     args = cfg.parse_args()
 
+    #if not args.distributed or dist.get_rank() == 0:
     wandb.init(
         project="0306_seg_GPU*2",
         name=args.exp_name,
