@@ -10,41 +10,74 @@ import cfg
 from conf import settings
 from func_2d.utils import *
 import pandas as pd
-
+# from accelerate import Accelerator
+# accelerator = Accelerator()  # 需确保在函数外初始化
 
 args = cfg.parse_args()
 
-GPUdevice = torch.device('cuda', args.gpu_device)
-pos_weight = torch.ones([1]).cuda(device=GPUdevice)*2
-criterion_G = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+# # 原代码（多处存在硬编码设备操作）
+# GPUdevice = torch.device('cuda:' + str(args.gpu_device))
+# pos_weight = torch.ones([1]).cuda(device=GPUdevice)*2
+# imgs = pack['image'].to(dtype = mask_type, device = GPUdevice)
+
+# # 修改后（所有设备操作使用 accelerator 管理）
+# from accelerate import Accelerator
+# accelerator = Accelerator()  # 需确保在函数外初始化
+
+# pos_weight = torch.ones([1]).to(accelerator.device) * 2
+# imgs = pack['image'].to(dtype=mask_type, device=accelerator.device)
+
+#GPUdevice = torch.device('cuda', args.gpu_device)
+
+#pos_weight = torch.ones([1]).cuda(device=GPUdevice)*2
+# pos_weight = torch.ones([1]).to(accelerator.device) *2
+
+
 mask_type = torch.float32
+
+
 
 torch.backends.cudnn.benchmark = True
 
 
-def train_sam(args, net: nn.Module, optimizer, train_loader, epoch):
+def train_sam(args, net: nn.Module, optimizer, train_loader, epoch,accelerator):
     
     # use bfloat16 for the entire notebook
-    torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+    # torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
 
-    if torch.cuda.get_device_properties(0).major >= 8:
-        # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+    # if torch.cuda.get_device_properties(0).major >= 8:
+    #     # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
+    #     torch.backends.cuda.matmul.allow_tf32 = True
+    #     torch.backends.cudnn.allow_tf32 = True
 
+    # 自动获取设备类型字符串（如 'cuda' 或 'cpu'）
+#    accelerator = Accelerator(mixed_precision="bf16")
+    # net, optimizer, train_loader = accelerator.prepare(net, optimizer, train_loader)
+
+    # 动态获取设备类型
+    # device_type = str(accelerator.device).split(':')[0]
     
-    # train mode
-    net.train()
+    # # 检查 Ampere GPU
+    # if accelerator.device.type == "cuda" and torch.cuda.get_device_properties(accelerator.device).major >= 8:
+        
+    #     if torch.cuda.get_device_properties(accelerator.device).major >= 8:
+    #         torch.backends.cuda.matmul.allow_tf32 = True
+    #         torch.backends.cudnn.allow_tf32 = True
+
     optimizer.zero_grad()
 
     # init
     epoch_loss = 0
+    epoch_grad_norm = 0
     memory_bank_list = []
+    pos_weight = torch.ones([1]).to(accelerator.device)*2
+    criterion_G = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     lossfunc = criterion_G
     feat_sizes = [(256, 256), (128, 128), (64, 64)]
 
 
-    with tqdm(total=len(train_loader), desc=f'Epoch {epoch}', unit='img') as pbar:
+    # with tqdm(total=len(train_loader), desc=f'Epoch {epoch}', unit='img') as pbar:
+    with tqdm(total=len(train_loader), desc=f'Epoch {epoch}', unit='img', disable=not accelerator.is_main_process) as pbar:
         for ind, pack in enumerate(train_loader):
             
             to_cat_memory = []
@@ -52,25 +85,27 @@ def train_sam(args, net: nn.Module, optimizer, train_loader, epoch):
             to_cat_image_embed = []
 
             # input image and gt masks
-            imgs = pack['image'].to(dtype = mask_type, device = GPUdevice)
-            masks = pack['mask'].to(dtype = mask_type, device = GPUdevice)
+            #imgs = pack['image'].to(dtype = mask_type, device = GPUdevice)
+            imgs = pack['image'].to(dtype=mask_type, device=accelerator.device)  
+            #masks = pack['mask'].to(dtype = mask_type, device = GPUdevice)
+            masks= pack['mask'].to(dtype=mask_type, device=accelerator.device)  
             name = pack['image_meta_dict']['filename_or_obj']
 
             # click prompt: unsqueeze to indicate only one click, add more click across this dimension
             if 'pt' in pack:
-                pt_temp = pack['pt'].to(device = GPUdevice)
+                pt_temp = pack['pt'].to(device = accelerator.device)
                 pt = pt_temp.unsqueeze(1)
-                point_labels_temp = pack['p_label'].to(device = GPUdevice)
+                point_labels_temp = pack['p_label'].to(device = accelerator.device)
                 point_labels = point_labels_temp.unsqueeze(1)
-                coords_torch = torch.as_tensor(pt, dtype=torch.float, device=GPUdevice)
-                labels_torch = torch.as_tensor(point_labels, dtype=torch.int, device=GPUdevice)
+                coords_torch = torch.as_tensor(pt, dtype=torch.float, device=accelerator.device)
+                labels_torch = torch.as_tensor(point_labels, dtype=torch.int, device=accelerator.device)
             else:
                 coords_torch = None
                 labels_torch = None
 
             '''Train image encoder'''                    
-            backbone_out = net.forward_image(imgs)
-            _, vision_feats, vision_pos_embeds, _ = net._prepare_backbone_features(backbone_out)
+            backbone_out = net.module.forward_image(imgs)
+            _, vision_feats, vision_pos_embeds, _ = net.module._prepare_backbone_features(backbone_out)
             # dimension hint for your future use
             # vision_feats: list: length = 3
             # vision_feats[0]: torch.Size([65536, batch, 32])
@@ -86,14 +121,21 @@ def train_sam(args, net: nn.Module, optimizer, train_loader, epoch):
             B = vision_feats[-1].size(1)  # batch size 
             
             if len(memory_bank_list) == 0:
-                vision_feats[-1] = vision_feats[-1] + torch.nn.Parameter(torch.zeros(1, B, net.hidden_dim)).to(device="cuda")
-                vision_pos_embeds[-1] = vision_pos_embeds[-1] + torch.nn.Parameter(torch.zeros(1, B, net.hidden_dim)).to(device="cuda")
+                vision_feats[-1] = vision_feats[-1] + torch.nn.Parameter(torch.zeros(1, B, net.module.hidden_dim)).to(device=accelerator.device)
+                vision_pos_embeds[-1] = vision_pos_embeds[-1] + torch.nn.Parameter(torch.zeros(1, B, net.module.hidden_dim)).to(device=accelerator.device)
                 
             else:
                 for element in memory_bank_list:
-                    to_cat_memory.append((element[0]).cuda(non_blocking=True).flatten(2).permute(2, 0, 1)) # maskmem_features
-                    to_cat_memory_pos.append((element[1]).cuda(non_blocking=True).flatten(2).permute(2, 0, 1)) # maskmem_pos_enc
-                    to_cat_image_embed.append((element[3]).cuda(non_blocking=True)) # image_embed
+                    mem_tensor = element[0].to(accelerator.device, non_blocking=True)
+                    mem_tensor = mem_tensor.flatten(2).permute(2, 0, 1)
+                    to_cat_memory.append(mem_tensor)
+        
+                    pos_tensor = element[1].to(accelerator.device, non_blocking=True)
+                    pos_tensor = pos_tensor.flatten(2).permute(2, 0, 1)
+                    to_cat_memory_pos.append(pos_tensor)
+        
+                    embed_tensor = element[3].to(accelerator.device, non_blocking=True)
+                    to_cat_image_embed.append(embed_tensor)
 
                 memory_stack_ori = torch.stack(to_cat_memory, dim=0)
                 memory_pos_stack_ori = torch.stack(to_cat_memory_pos, dim=0)
@@ -116,7 +158,7 @@ def train_sam(args, net: nn.Module, optimizer, train_loader, epoch):
                 memory_pos = memory_pos_stack_new.reshape(-1, memory_stack_ori_new.size(2), memory_stack_ori_new.size(3))
 
 
-                vision_feats[-1] = net.memory_attention(
+                vision_feats[-1] = net.module.memory_attention(
                     curr=[vision_feats[-1]],
                     curr_pos=[vision_pos_embeds[-1]],
                     memory=memory,
@@ -145,7 +187,7 @@ def train_sam(args, net: nn.Module, optimizer, train_loader, epoch):
                     points=None
                     flag = False
 
-                se, de = net.sam_prompt_encoder(
+                se, de = net.module.sam_prompt_encoder(
                     points=points, #(coords_torch, labels_torch)
                     boxes=None,
                     masks=None,
@@ -159,9 +201,9 @@ def train_sam(args, net: nn.Module, optimizer, train_loader, epoch):
 
             
             '''train mask decoder'''       
-            low_res_multimasks, iou_predictions, sam_output_tokens, object_score_logits = net.sam_mask_decoder(
+            low_res_multimasks, iou_predictions, sam_output_tokens, object_score_logits = net.module.sam_mask_decoder(
                     image_embeddings=image_embed,
-                    image_pe=net.sam_prompt_encoder.get_dense_pe(), 
+                    image_pe=net.module.sam_prompt_encoder.get_dense_pe(), 
                     sparse_prompt_embeddings=se,
                     dense_prompt_embeddings=de, 
                     multimask_output=False, # args.multimask_output if you want multiple masks
@@ -183,7 +225,7 @@ def train_sam(args, net: nn.Module, optimizer, train_loader, epoch):
 
             '''memory encoder'''       
             # new caluculated memory features
-            maskmem_features, maskmem_pos_enc = net._encode_new_memory(
+            maskmem_features, maskmem_pos_enc = net.module._encode_new_memory(
                 current_vision_feats=vision_feats,
                 feat_sizes=feat_sizes,
                 pred_masks_high_res=high_res_multimasks,
@@ -192,10 +234,10 @@ def train_sam(args, net: nn.Module, optimizer, train_loader, epoch):
             # maskmem_features: torch.Size([batch, 64, 64, 64])
             # maskmem_pos_enc: [torch.Size([batch, 64, 64, 64])]
                 
-            maskmem_features = maskmem_features.to(torch.bfloat16)
-            maskmem_features = maskmem_features.to(device=GPUdevice, non_blocking=True)
-            maskmem_pos_enc = maskmem_pos_enc[0].to(torch.bfloat16)
-            maskmem_pos_enc = maskmem_pos_enc.to(device=GPUdevice, non_blocking=True)
+            # maskmem_features = maskmem_features.to(torch.bfloat16)
+            maskmem_features = maskmem_features.to(device=accelerator.device, non_blocking=True)
+            # maskmem_pos_enc = maskmem_pos_enc[0].to(torch.bfloat16)
+            maskmem_pos_enc = maskmem_pos_enc[0].to(device=accelerator.device, non_blocking=True)
 
 
             # add single maskmem_features, maskmem_pos_enc, iou
@@ -241,40 +283,65 @@ def train_sam(args, net: nn.Module, optimizer, train_loader, epoch):
 
             # backpropagation
             loss = lossfunc(pred, masks)
-            pbar.set_postfix(**{'loss (batch)': loss.item()})
+            if accelerator.is_main_process:
+                pbar.set_postfix(**{'loss (batch)': loss.item()})
             epoch_loss += loss.item()
 
-            loss.backward()
-            optimizer.step()
+            # loss.backward()
+            with accelerator.accumulate(net):  # ✅ 自动处理梯度累积
+                accelerator.backward(loss)
+                
+                grad_norm = 0
+                for param in accelerator.unwrap_model(net).parameters():
+                    if param.grad is not None:
+                        grad_norm += torch.norm(param.grad, p=2).item() ** 2
+                grad_norm = grad_norm ** 0.5  # L2 范数
+                epoch_grad_norm += grad_norm
+                
+                optimizer.step()
+                optimizer.zero_grad()
             
-            optimizer.zero_grad()
+            if accelerator.is_main_process:
+                pbar.set_postfix(**{'loss (batch)': loss.item(), 'grad_norm': grad_norm})
+                pbar.update()
 
-            pbar.update()
+    epoch_loss_tensor = torch.tensor(epoch_loss / len(train_loader), device=accelerator.device)
+    epoch_grad_norm_tensor = torch.tensor(epoch_grad_norm / len(train_loader), device=accelerator.device)
+    epoch_loss = accelerator.reduce(epoch_loss_tensor, reduction="mean").item()
+    epoch_grad_norm = accelerator.reduce(epoch_grad_norm_tensor, reduction="mean").item()
 
-    return epoch_loss/len(train_loader)
+    return epoch_loss,epoch_grad_norm
 
 
 
 
-def validation_sam(args, val_loader, epoch, net: nn.Module, clean_dir=True):
+def validation_sam(args, val_loader, epoch, net: nn.Module, accelerator,clean_dir=True):
 
     # use bfloat16 for the entire notebook
-    torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+    # torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
 
-    if torch.cuda.get_device_properties(0).major >= 8:
-        # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-
+    # if torch.cuda.get_device_properties(0).major >= 8:
+    #     # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
+    #     torch.backends.cuda.matmul.allow_tf32 = True
+    #     torch.backends.cudnn.allow_tf32 = True
+    if accelerator.device.type == "cuda":
+        # 动态检查当前 GPU 架构
+        major = torch.cuda.get_device_properties(accelerator.device).major
+        if major >= 8:
+            # 如果主脚本未全局设置，可在此启用
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
 
     # eval mode
     net.eval()
 
     n_val = len(val_loader) 
     threshold = (0.1, 0.3, 0.5, 0.7, 0.9)
-    GPUdevice = torch.device('cuda:' + str(args.gpu_device))
+    # GPUdevice = torch.device('cuda:' + str(args.gpu_device))
 
     # init
+    pos_weight = torch.ones([1]).to(accelerator.device)*2
+    criterion_G = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     lossfunc = criterion_G
     memory_bank_list = []
     feat_sizes = [(256, 256), (128, 128), (64, 64)]
@@ -283,24 +350,26 @@ def validation_sam(args, val_loader, epoch, net: nn.Module, clean_dir=True):
     total_dice = 0
 
 
-    with tqdm(total=n_val, desc='Validation round', unit='batch', leave=False) as pbar:
+    # with tqdm(total=n_val, desc='Validation round', unit='batch', leave=False) as pbar:
+    with tqdm(total=n_val, desc='Validation round', unit='batch', leave=False, disable=not accelerator.is_main_process) as pbar:
+        
         for ind, pack in enumerate(val_loader):
             to_cat_memory = []
             to_cat_memory_pos = []
             to_cat_image_embed = []
 
             name = pack['image_meta_dict']['filename_or_obj']
-            imgs = pack['image'].to(dtype = torch.float32, device = GPUdevice)
-            masks = pack['mask'].to(dtype = torch.float32, device = GPUdevice)
+            imgs = pack['image'].to(dtype = torch.float32, device = accelerator.device)
+            masks = pack['mask'].to(dtype = torch.float32, device = accelerator.device)
 
             
             if 'pt' in pack:
-                pt_temp = pack['pt'].to(device = GPUdevice)
+                pt_temp = pack['pt'].to(device = accelerator.device)
                 pt = pt_temp.unsqueeze(1)
-                point_labels_temp = pack['p_label'].to(device = GPUdevice)
+                point_labels_temp = pack['p_label'].to(device = accelerator.device)
                 point_labels = point_labels_temp.unsqueeze(1)
-                coords_torch = torch.as_tensor(pt, dtype=torch.float, device=GPUdevice)
-                labels_torch = torch.as_tensor(point_labels, dtype=torch.int, device=GPUdevice)
+                coords_torch = torch.as_tensor(pt, dtype=torch.float, device=accelerator.device)
+                labels_torch = torch.as_tensor(point_labels, dtype=torch.int, device=accelerator.device)
             else:
                 coords_torch = None
                 labels_torch = None
@@ -308,18 +377,22 @@ def validation_sam(args, val_loader, epoch, net: nn.Module, clean_dir=True):
 
 
             '''test'''
-            with torch.no_grad():
+            # with torch.no_grad():
+            with accelerator.no_sync(net), torch.no_grad(): 
 
                 """ image encoder """
-                backbone_out = net.forward_image(imgs)
-                _, vision_feats, vision_pos_embeds, _ = net._prepare_backbone_features(backbone_out)
+                # backbone_out = net.forward_image(imgs)
+                backbone_out = net.module.forward_image(imgs)
+                # _, vision_feats, vision_pos_embeds, _ = net._prepare_backbone_features(backbone_out)
+                _, vision_feats, vision_pos_embeds, _ = net.module._prepare_backbone_features(backbone_out)
                 B = vision_feats[-1].size(1) 
 
                 """ memory condition """
                 if len(memory_bank_list) == 0:
-                    vision_feats[-1] = vision_feats[-1] + torch.nn.Parameter(torch.zeros(1, B, net.hidden_dim)).to(device="cuda")
-                    vision_pos_embeds[-1] = vision_pos_embeds[-1] + torch.nn.Parameter(torch.zeros(1, B, net.hidden_dim)).to(device="cuda")
-
+                    # vision_feats[-1] = vision_feats[-1] + torch.nn.Parameter(torch.zeros(1, B, net.hidden_dim)).to(device="cuda")
+                    # vision_pos_embeds[-1] = vision_pos_embeds[-1] + torch.nn.Parameter(torch.zeros(1, B, net.hidden_dim)).to(device="cuda")
+                    vision_feats[-1] = vision_feats[-1] + torch.nn.Parameter(torch.zeros(1, B, net.module.hidden_dim)).to(device=accelerator.device)
+                    vision_pos_embeds[-1] = vision_pos_embeds[-1] + torch.nn.Parameter(torch.zeros(1, B, net.module.hidden_dim)).to(device=accelerator.device)
                 else:
                     for element in memory_bank_list:
                         maskmem_features = element[0]
@@ -350,7 +423,7 @@ def validation_sam(args, val_loader, epoch, net: nn.Module, clean_dir=True):
 
 
 
-                    vision_feats[-1] = net.memory_attention(
+                    vision_feats[-1] = net.module.memory_attention(
                         curr=[vision_feats[-1]],
                         curr_pos=[vision_pos_embeds[-1]],
                         memory=memory,
@@ -373,16 +446,16 @@ def validation_sam(args, val_loader, epoch, net: nn.Module, clean_dir=True):
                     flag = False
                     points = None
 
-                se, de = net.sam_prompt_encoder(
+                se, de = net.module.sam_prompt_encoder(
                     points=points, 
                     boxes=None,
                     masks=None,
                     batch_size=B,
                 )
 
-                low_res_multimasks, iou_predictions, sam_output_tokens, object_score_logits = net.sam_mask_decoder(
+                low_res_multimasks, iou_predictions, sam_output_tokens, object_score_logits = net.module.sam_mask_decoder(
                     image_embeddings=image_embed,
-                    image_pe=net.sam_prompt_encoder.get_dense_pe(), 
+                    image_pe=net.module.sam_prompt_encoder.get_dense_pe(), 
                     sparse_prompt_embeddings=se,
                     dense_prompt_embeddings=de, 
                     multimask_output=False, 
@@ -396,16 +469,16 @@ def validation_sam(args, val_loader, epoch, net: nn.Module, clean_dir=True):
                                                 mode="bilinear", align_corners=False)
             
                 """ memory encoder """
-                maskmem_features, maskmem_pos_enc = net._encode_new_memory( 
+                maskmem_features, maskmem_pos_enc = net.module._encode_new_memory( 
                     current_vision_feats=vision_feats,
                     feat_sizes=feat_sizes,
                     pred_masks_high_res=high_res_multimasks,
                     is_mask_from_pts=flag)  
                     
-                maskmem_features = maskmem_features.to(torch.bfloat16)
-                maskmem_features = maskmem_features.to(device=GPUdevice, non_blocking=True)
-                maskmem_pos_enc = maskmem_pos_enc[0].to(torch.bfloat16)
-                maskmem_pos_enc = maskmem_pos_enc.to(device=GPUdevice, non_blocking=True)
+                # maskmem_features = maskmem_features.to(torch.bfloat16)
+                maskmem_features = maskmem_features.to(device=accelerator.device, non_blocking=True)
+                # maskmem_pos_enc = maskmem_pos_enc[0].to(torch.bfloat16)
+                maskmem_pos_enc = maskmem_pos_enc[0].to(device=accelerator.device, non_blocking=True)
 
 
                 """ memory bank """
@@ -444,21 +517,30 @@ def validation_sam(args, val_loader, epoch, net: nn.Module, clean_dir=True):
                                                          image_embed[batch].reshape(-1).detach()])
 
                 # binary mask and calculate loss, iou, dice
-                total_loss += lossfunc(pred, masks)
+                total_loss += lossfunc(pred, masks).item()
                 pred = (pred> 0.5).float()
-                temp = eval_seg(pred, masks, threshold)
-                total_eiou += temp[0]
-                total_dice += temp[1]
+                # temp = eval_seg(pred, masks, threshold,accelerator)
+                # total_eiou += temp[0]
+                # total_dice += temp[1]
+                eiou, edice = eval_seg(pred, masks, threshold, accelerator)  # 直接解包返回值
+                total_eiou += eiou
+                total_dice += edice
 
-                '''vis images'''
-                if ind % args.vis == 0:
+                '''vis images''' 
+                if ind % args.vis == 0 and accelerator.is_main_process:
                     namecat = 'Test'
                     for na in name:
                         img_name = na
                         namecat = namecat + img_name + '+'
-                    vis_image(imgs,pred, masks, os.path.join(args.path_helper['sample_path'], namecat+'epoch+' +str(epoch) + '.jpg'), reverse=False, points=None)
-                            
-            pbar.update()
+                    vis_image(imgs,pred, masks, os.path.join(args.path_helper['sample_path'], namecat+'epoch+' +str(epoch) + '.jpg'), accelerator,reverse=False, points=None)
+                if accelerator.is_main_process:            
+                    pbar.update()
 
+    total_loss_tensor = torch.tensor(total_loss / n_val, device=accelerator.device)
+    total_eiou_tensor = torch.tensor(total_eiou / n_val, device=accelerator.device)
+    total_dice_tensor = torch.tensor(total_dice / n_val, device=accelerator.device)
+    total_loss = accelerator.reduce(total_loss_tensor, reduction="mean").item()
+    total_eiou = accelerator.reduce(total_eiou_tensor, reduction="mean").item()
+    total_dice = accelerator.reduce(total_dice_tensor, reduction="mean").item()
     return total_loss/ n_val , tuple([total_eiou/n_val, total_dice/n_val])
 

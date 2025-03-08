@@ -21,39 +21,48 @@ from conf import settings
 #from models.discriminatorlayer import discriminator
 from func_2d.dataset import *
 from func_2d.utils import *
+from accelerate import Accelerator
+
 
 
 def main():
     # use bfloat16 for the entire work
-    torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+    #torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+    accelerator = Accelerator()
+    device_type = str(accelerator.device).split(':')[0]  # 提取 'cuda' 或 'cpu'
+    # with torch.autocast(device_type=device_type, dtype=torch.bfloat16):  # ✅ 正确上下文管理
 
-    if torch.cuda.get_device_properties(0).major >= 8:
-        # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+    # if torch.cuda.get_device_properties(0).major >= 8:
+    #     # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
+    #     torch.backends.cuda.matmul.allow_tf32 = True
+    #     torch.backends.cudnn.allow_tf32 = True
+    if accelerator.device.type == "cuda" and torch.cuda.get_device_properties(accelerator.device).major >= 8:
+        if torch.cuda.get_device_properties(accelerator.device).major >= 8:  # ✅ 动态检查当前设备
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            if accelerator.is_main_process:
+                print("TF32 enabled for Ampere GPUs")
 
     args = cfg.parse_args()
 
     #if not args.distributed or dist.get_rank() == 0:
-    wandb.init(
-        project="0306_seg_GPU*2",
-        name=args.exp_name,
-        config={
-                "learning_rate": args.lr,
-                "batch_size": args.b,
-                "image_size": args.image_size,
-                "out_size": args.out_size,
-                "dataset": args.dataset,
-                "epochs": settings.EPOCH,
-                "val_freq": args.val_freq,
-        }
-    )
+    if accelerator.is_main_process:
+        wandb.init(project="0306_seg_GPU*2", name=args.exp_name, config={
+            "learning_rate": args.lr,
+            "batch_size": args.b,
+            "image_size": args.image_size,
+            "out_size": args.out_size,
+            "dataset": args.dataset,
+            "epochs": settings.EPOCH,
+            "val_freq": args.val_freq,
+        })
 
+    
 
-    GPUdevice = torch.device('cuda', args.gpu_device)
+    # GPUdevice = torch.device('cuda', args.gpu_device)
 
-    net = get_network(args, args.net, use_gpu=args.gpu, gpu_device=GPUdevice, distribution = args.distributed)
-
+    # net = get_network(args, args.net, use_gpu=args.gpu, gpu_device=accelerator.device, distribution = args.distributed)
+    net = get_network(args, args.net, use_gpu=args.gpu, gpu_device=accelerator.device, distribution=args.distributed, accelerator=accelerator)
     # optimisation
     optimizer = optim.Adam(net.parameters(), lr=args.lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=0, amsgrad=False)
     # scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5) 
@@ -62,7 +71,8 @@ def main():
 
     args.path_helper = set_log_dir('logs', args.exp_name)
     logger = create_logger(args.path_helper['log_path'])
-    logger.info(args)
+    if accelerator.is_main_process:
+        logger.info(args)
 
 
     '''segmentation data'''
@@ -99,7 +109,8 @@ def main():
         nice_train_loader = DataLoader(refuge_train_dataset, batch_size=args.b, shuffle=True, num_workers=2, pin_memory=True)
         nice_test_loader = DataLoader(refuge_test_dataset, batch_size=args.b, shuffle=False, num_workers=2, pin_memory=True)
         '''end'''
-
+    net, optimizer, nice_train_loader,nice_test_loader = accelerator.prepare(
+        net, optimizer, nice_train_loader,nice_test_loader)
 
     '''checkpoint path and tensorboard'''
     checkpoint_path = os.path.join(settings.CHECKPOINT_PATH, args.net, settings.TIME_NOW)
@@ -123,37 +134,53 @@ def main():
     for epoch in range(settings.EPOCH):
 
         if epoch == 0:
-            tol, (eiou, edice) = function.validation_sam(args, nice_test_loader, epoch, net)
-            logger.info(f'Total score: {tol}, IOU: {eiou}, DICE: {edice} || @ epoch {epoch}.')
+            
+            tol, (eiou, edice) = function.validation_sam(args, nice_test_loader, epoch, net, accelerator)  # 传递 accelerator
+            # tol, (eiou, edice) = function.validation_sam(args, nice_test_loader, epoch, net)
+            if accelerator.is_main_process:
+                logger.info(f'Total score: {tol}, IOU: {eiou}, DICE: {edice} || @ epoch {epoch}.')
 
         # training
         net.train()
         time_start = time.time()
-        loss = function.train_sam(args, net, optimizer, nice_train_loader, epoch)
-        logger.info(f'Train loss: {loss} || @ epoch {epoch}.')
-        wandb.log({"train_loss": loss, "epoch": epoch})   
+        loss, grad_norm = function.train_sam(args, net, optimizer, nice_train_loader, epoch, accelerator)  # 传递 accelerator
+
+        # loss = function.train_sam(args, net, optimizer, nice_train_loader, epoch)
         time_end = time.time()
-        print('time_for_training ', time_end - time_start)
+        if accelerator.is_main_process:
+            logger.info(f'Train loss: {loss}, Grad Norm: {grad_norm} || @ epoch {epoch}.')
+            wandb.log({"train_loss": loss, "grad_norm": grad_norm, "epoch": epoch})
+            print('time_for_training ', time_end - time_start)
 
         # validation
         net.eval()
+        
         if epoch % args.val_freq == 0 or epoch == settings.EPOCH-1:
-
-            tol, (eiou, edice) = function.validation_sam(args, nice_test_loader, epoch, net,)
-            logger.info(f'Total score: {tol}, IOU: {eiou}, DICE: {edice} || @ epoch {epoch}.')
-            wandb.log({
-                "val_total_score": tol,
-                "val_iou": eiou,
-                "val_dice": edice,
-                "epoch": epoch
-                })
+            
+            tol, (eiou, edice) = function.validation_sam(args, nice_test_loader, epoch, net, accelerator)  # 传递 accelerator
+            if accelerator.is_main_process:
+            # tol, (eiou, edice) = function.validation_sam(args, nice_test_loader, epoch, net,)
+                logger.info(f'Total score: {tol}, IOU: {eiou}, DICE: {edice} || @ epoch {epoch}.')
+                wandb.log({
+                    "val_total_score": tol,
+                    "val_iou": eiou,
+                    "val_dice": edice,
+                    "epoch": epoch
+                    })
             if edice > best_dice:
                 best_dice = edice
-                torch.save({'model': net.state_dict(), 'parameter': net._parameters}, os.path.join(args.path_helper['ckpt_path'], 'latest_epoch.pth'))
-                wandb.save(os.path.join(args.path_helper['ckpt_path'], 'latest_epoch.pth'))
+                if accelerator.is_main_process:
+                    accelerator.save(
+                                {'model': net.state_dict(), 'parameter': net._parameters},
+                os.path.join(args.path_helper['ckpt_path'], 'latest_epoch.pth')
+        )
+                if wandb.run is not None:  # 确保 WandB 已初始化
+                        wandb.save(os.path.join(args.path_helper['ckpt_path'], 'latest_epoch.pth'))
+                
 
-#    writer.close()
-    wandb.finish()
+
+    if accelerator.is_main_process:
+        wandb.finish()
 
 if __name__ == '__main__':
     main()

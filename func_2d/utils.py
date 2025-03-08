@@ -28,19 +28,22 @@ import torchvision
 import torchvision.utils as vutils
 from PIL import Image
 from torch.autograd import Function
+# from accelerate import Accelerator
+
 
 
 import cfg
 
 import pandas as pd
 
-
+#accelerator = Accelerator()
 args = cfg.parse_args()
-device = torch.device('cuda', args.gpu_device)
+# device = torch.device('cuda', args.gpu_device)
 
 
 
-def get_network(args, net, use_gpu=True, gpu_device = 0, distribution = True):
+# def get_network(args, net, use_gpu=True, gpu_device = 0, distribution = True):
+def get_network(args, net, use_gpu=True, gpu_device=None, distribution=False, accelerator=None):
     """ return given network
     """
 
@@ -48,25 +51,35 @@ def get_network(args, net, use_gpu=True, gpu_device = 0, distribution = True):
     if net == 'sam2':
         from sam2_train.build_sam import build_sam2
         from sam2_train.sam2_image_predictor import SAM2ImagePredictor
-        torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
-        if torch.cuda.get_device_properties(0).major >= 8:
-            # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-        net = build_sam2(args.sam_config, args.sam_ckpt, device="cuda")
+        net = build_sam2(args.sam_config, args.sam_ckpt)
+        # net = accelerator.prepare(net) # ✅ 统一由 Accelerator 管理
+        
+    device_type = str(accelerator.device).split(':')[0]  # 提取 'cuda' 或 'cpu'
+    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):  # ✅ 正确上下文管理
+
+    # if torch.cuda.get_device_properties(0).major >= 8:
+    #     # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
+    #     torch.backends.cuda.matmul.allow_tf32 = True
+    #     torch.backends.cudnn.allow_tf32 = True
+        if accelerator.device.type == "cuda":
+            if torch.cuda.get_device_properties(accelerator.device).major >= 8:  # ✅ 动态检查当前设备
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+    
+        net = build_sam2(args.sam_config, args.sam_ckpt, device=accelerator.device)
 
 
-    else:
-        print('the network name you have entered is not supported yet')
-        sys.exit()
+    # else:
+    #     print('the network name you have entered is not supported yet')
+    #     sys.exit()
 
-    if use_gpu:
-        #net = net.cuda(device = gpu_device)
-        if distribution != 'none':
-            net = torch.nn.DataParallel(net,device_ids=[int(id) for id in args.distributed.split(',')])
-            net = net.to(device=gpu_device)
-        else:
-            net = net.to(device=gpu_device)
+    # if use_gpu:
+    #     #net = net.cuda(device = gpu_device)
+    #     if distribution != 'none':
+    #         net = torch.nn.DataParallel(net,device_ids=[int(id) for id in args.distributed.split(',')])
+    #         net = net.to(device=accelerator.device)
+    #     else:
+    #         net = net.to(device=accelerator.device)
 
     return net
 
@@ -200,21 +213,22 @@ def set_log_dir(root_dir, exp_name):
     now = datetime.now(dateutil.tz.tzlocal())
     timestamp = now.strftime('%Y_%m_%d_%H_%M_%S')
     prefix = exp_path + '_' + timestamp
-    os.makedirs(prefix)
+#    os.makedirs(prefix)
+    os.makedirs(prefix, exist_ok=True)
     path_dict['prefix'] = prefix
 
     # set checkpoint path
     ckpt_path = os.path.join(prefix, 'Model')
-    os.makedirs(ckpt_path)
+    os.makedirs(ckpt_path, exist_ok=True)
     path_dict['ckpt_path'] = ckpt_path
 
     log_path = os.path.join(prefix, 'Log')
-    os.makedirs(log_path)
+    os.makedirs(log_path, exist_ok=True)
     path_dict['log_path'] = log_path
 
     # set sample image path for fid calculation
     sample_path = os.path.join(prefix, 'Samples')
-    os.makedirs(sample_path)
+    os.makedirs(sample_path, exist_ok=True)
     path_dict['sample_path'] = sample_path
 
     return path_dict
@@ -266,17 +280,23 @@ class DiceCoeff(Function):
         return grad_input, grad_target
 
 
-def dice_coeff(input, target):
+def dice_coeff(input, target,accelerator):
     """Dice coeff for batches"""
+    input, target = accelerator.gather((input, target))
     if input.is_cuda:
         s = torch.FloatTensor(1).to(device = input.device).zero_()
     else:
         s = torch.FloatTensor(1).zero_()
-
+    if input.is_cuda:
+        s = torch.FloatTensor(1).to(device=input.device).zero_()
+    else:
+        s = torch.FloatTensor(1).zero_()
     for i, c in enumerate(zip(input, target)):
         s = s + DiceCoeff().forward(c[0], c[1])
+    s=s / (i + 1)
 
-    return s / (i + 1)
+
+    return s 
 
 
 
@@ -302,8 +322,9 @@ def view(tensor):
 
 
 
-def vis_image(imgs, pred_masks, gt_masks, save_path, reverse = False, points = None):
-    
+def vis_image(imgs, pred_masks, gt_masks, save_path, accelerator,reverse = False, points = None):
+    if not accelerator.is_main_process:
+        return
     b,c,h,w = pred_masks.size()
     dev = pred_masks.get_device()
     row_num = min(b, 4)
@@ -351,11 +372,11 @@ def vis_image(imgs, pred_masks, gt_masks, save_path, reverse = False, points = N
         tup = (imgs[:row_num,:,:,:],pred_masks[:row_num,:,:,:], gt_masks[:row_num,:,:,:])
         # compose = torch.cat((imgs[:row_num,:,:,:],pred_disc[:row_num,:,:,:], pred_cup[:row_num,:,:,:], gt_disc[:row_num,:,:,:], gt_cup[:row_num,:,:,:]),0)
         compose = torch.cat(tup,0)
-        vutils.save_image(compose, fp = save_path, nrow = row_num, padding = 10)
+    vutils.save_image(compose, fp = save_path, nrow = row_num, padding = 10)
 
-    return
+    
 
-def eval_seg(pred,true_mask_p,threshold):
+def eval_seg(pred,true_mask_p,threshold, accelerator):
     '''
     threshold: a int or a tuple of int
     masks: [b,2,h,w]
@@ -380,8 +401,8 @@ def eval_seg(pred,true_mask_p,threshold):
             iou_c += iou(cup_pred,cup_mask)
 
             '''dice for torch'''
-            disc_dice += dice_coeff(vpred[:,0,:,:], gt_vmask_p[:,0,:,:]).item()
-            cup_dice += dice_coeff(vpred[:,1,:,:], gt_vmask_p[:,1,:,:]).item()
+            disc_dice += dice_coeff(vpred[:,0,:,:], gt_vmask_p[:,0,:,:],accelerator).item()
+            cup_dice += dice_coeff(vpred[:,1,:,:], gt_vmask_p[:,1,:,:],accelerator).item()
             
         return iou_d / len(threshold), iou_c / len(threshold), disc_dice / len(threshold), cup_dice / len(threshold)
     elif c > 2: # for multi-class segmentation > 2 classes
@@ -399,7 +420,7 @@ def eval_seg(pred,true_mask_p,threshold):
                 ious[i] += iou(pred,mask)
 
                 '''dice for torch'''
-                dices[i] += dice_coeff(vpred[:,i,:,:], gt_vmask_p[:,i,:,:]).item()
+                dices[i] += dice_coeff(vpred[:,i,:,:], gt_vmask_p[:,i,:,:],accelerator).item()
             
         return tuple(np.array(ious + dices) / len(threshold)) # tuple has a total number of c * 2
     else:
@@ -417,9 +438,13 @@ def eval_seg(pred,true_mask_p,threshold):
             eiou += iou(disc_pred,disc_mask)
 
             '''dice for torch'''
-            edice += dice_coeff(vpred[:,0,:,:], gt_vmask_p[:,0,:,:]).item()
+            edice += dice_coeff(vpred[:,0,:,:], gt_vmask_p[:,0,:,:],accelerator).item()
             
-        return eiou / len(threshold), edice / len(threshold)
+        eiou_tensor = torch.tensor(eiou / len(threshold), device=accelerator.device)
+        edice_tensor = torch.tensor(edice / len(threshold), device=accelerator.device)
+        eiou = accelerator.reduce(eiou_tensor, reduction="mean").item()
+        edice = accelerator.reduce(edice_tensor, reduction="mean").item()
+        return eiou , edice
 
 
 def random_click(mask, point_label = 1):
