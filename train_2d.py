@@ -13,7 +13,7 @@ import torch.optim as optim
 import torchvision.transforms as transforms
 from tensorboardX import SummaryWriter
 #from dataset import *
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader,Subset
 
 import cfg
 import func_2d.function as function
@@ -76,12 +76,24 @@ def main():
         transforms.ToTensor(),
     ])
 
-    
     # example of REFUGE dataset
     if args.dataset == 'REFUGE':
         '''REFUGE data'''
         refuge_train_dataset = REFUGE(args, args.data_path, transform = transform_train, mode = 'Training')
         refuge_test_dataset = REFUGE(args, args.data_path, transform = transform_test, mode = 'Test')
+        
+        train_size = len(refuge_train_dataset)
+        train_indices = list(range(train_size))
+        random.shuffle(train_indices)
+        train_indices = train_indices[:100]  # 只取 100 个样本
+        refuge_train_dataset = Subset(refuge_train_dataset, train_indices)  # 创建子数据集
+
+        # 限制验证集大小为 100
+        test_size = len(refuge_test_dataset)
+        test_indices = list(range(test_size))
+        random.shuffle(test_indices)
+        test_indices = test_indices[:100]  # 只取 100 个样本
+        refuge_test_dataset = Subset(refuge_test_dataset, test_indices)  # 创建子数据集
 
         nice_train_loader = DataLoader(refuge_train_dataset, batch_size=args.b, shuffle=True, num_workers=2, pin_memory=True)
         nice_test_loader = DataLoader(refuge_test_dataset, batch_size=args.b, shuffle=False, num_workers=2, pin_memory=True)
